@@ -4,7 +4,10 @@ from config.db import get_database
 import subprocess
 import yaml, os
 
-CONFIG_FILE = "/etc/cloudflared/config.yml"
+# Use a config file in the user's home directory or project directory
+CONFIG_FILE = os.path.expanduser("~/.cloudflared/config.yml")
+# Alternative: Use project-specific config
+# CONFIG_FILE = os.path.join(os.getenv("BASE_DIR", ""), "cloudflared-config.yml")
 
 
 def deploy_pm2(project_name: str):
@@ -68,8 +71,28 @@ child.on('close', (code) => {{
 
 
 def update_cloudflare_config(hostname: str, port: int):
-    with open(CONFIG_FILE) as f:
-        data = yaml.safe_load(f)
+    # Ensure the config directory exists
+    config_dir = os.path.dirname(CONFIG_FILE)
+    if not os.path.exists(config_dir):
+        os.makedirs(config_dir, exist_ok=True)
+    
+    # Initialize config file if it doesn't exist
+    if not os.path.exists(CONFIG_FILE):
+        initial_config = {
+            "tunnel": os.getenv("CLOUDFLARE_TUNNEL_ID", "your-tunnel-id"),
+            "credentials-file": os.path.expanduser("~/.cloudflared/credentials.json"),
+            "ingress": [
+                {"service": "http_status:404"}
+            ]
+        }
+        with open(CONFIG_FILE, "w") as f:
+            yaml.safe_dump(initial_config, f)
+    
+    try:
+        with open(CONFIG_FILE) as f:
+            data = yaml.safe_load(f)
+    except FileNotFoundError:
+        data = {"ingress": []}
 
     # pastikan key ingress ada
     if "ingress" not in data:
@@ -95,19 +118,42 @@ def update_cloudflare_config(hostname: str, port: int):
     with open(CONFIG_FILE, "w") as f:
         yaml.safe_dump(data, f)
 
-    # restart cloudflared
-    subprocess.run(["systemctl", "restart", "cloudflared"])
+    # restart cloudflared with the custom config
+    try:
+        subprocess.run(["cloudflared", "tunnel", "run", "--config", CONFIG_FILE], check=False)
+    except subprocess.CalledProcessError as e:
+        print(f"Warning: Could not restart cloudflared: {e}")
+        print(f"You may need to manually restart cloudflared with: cloudflared tunnel run --config {CONFIG_FILE}")
     
 def generate_subdomain(project_name: str):
     # Placeholder implementation
     db = get_database()
     collection = db["domains"]
-    subdomain = collection.find_one({"project_name": project_name}).get("subdomain", "")
-    port = collection.find_one({"project_name": project_name}).get("port", "")
+    project = collection.find_one({"project_name": project_name})
+    
+    if not project:
+        return {"error": f"Project {project_name} not found"}
+    
+    subdomain = project.get("subdomain", "")
+    port = project.get("port", "")
+    
+    if not subdomain or not port:
+        return {"error": "Missing subdomain or port configuration"}
+    
     full_domain = f'{subdomain}.nusarithm.id'  # Replace with your actual domain logic
-    subprocess.run([
-        "cloudflared", "tunnel", "route", "dns", "nusadeploy", full_domain
-    ])
-    update_cloudflare_config(full_domain, port)
-    return {"domain": 'https://'+full_domain, "port": port}
+    
+    try:
+        # Add DNS route
+        subprocess.run([
+            "cloudflared", "tunnel", "route", "dns", "nusadeploy", full_domain
+        ], check=True)
+        
+        # Update config
+        update_cloudflare_config(full_domain, port)
+        
+        return {"domain": 'https://'+full_domain, "port": port}
+    except subprocess.CalledProcessError as e:
+        return {"error": f"Failed to configure cloudflare: {e}"}
+    except Exception as e:
+        return {"error": f"Configuration error: {e}"}
     
